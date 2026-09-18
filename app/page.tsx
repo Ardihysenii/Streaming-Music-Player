@@ -1,6 +1,6 @@
 "use client";
 
-import { ChangeEvent, FormEvent, useEffect, useMemo, useRef, useState } from "react";
+import { FormEvent, useEffect, useMemo, useRef, useState } from "react";
 import { deleteOfflineTrack, getOfflineTrack, listOfflineTracks, saveOfflineTrack, type OfflineTrack } from "../lib/offline-store";
 import type { LyricsPayload, LyricLine, YouTubeVideo } from "../lib/types";
 
@@ -76,7 +76,7 @@ export default function HomePage() {
   const [offlineTracks, setOfflineTracks] = useState<OfflineTrack[]>([]);
   const [selected, setSelected] = useState<YouTubeVideo | null>(null);
   const [offlineUrl, setOfflineUrl] = useState("");
-  const [offlineBusy, setOfflineBusy] = useState(false);
+  const [downloadingTrackId, setDownloadingTrackId] = useState<string | null>(null);
   const [query, setQuery] = useState("");
   const [activeQuery, setActiveQuery] = useState("");
   const [view, setView] = useState<View>("home");
@@ -94,8 +94,6 @@ export default function HomePage() {
   const playerFrameRef = useRef<HTMLIFrameElement | null>(null);
   const playerApiRef = useRef<YouTubePlayerInstance | null>(null);
   const offlineAudioRef = useRef<HTMLAudioElement | null>(null);
-  const importInputRef = useRef<HTMLInputElement | null>(null);
-  const importTrackRef = useRef<YouTubeVideo | null>(null);
 
   const loadTracks = async (search = "") => {
     setLoading(true);
@@ -331,32 +329,39 @@ export default function HomePage() {
   };
 
   const storeOfflineAudio = async (track: YouTubeVideo, audio: Blob) => {
-    setOfflineBusy(true);
-    try {
-      await saveOfflineTrack({ ...track, audio, audioType: audio.type || "audio/mpeg", bytes: audio.size, savedAt: Date.now() });
-      setOfflineTracks(await listOfflineTracks());
-      setToast(`${track.name} is available offline`);
-    } catch {
-      setToast("Could not save this audio on the device");
-    } finally {
-      setOfflineBusy(false);
-    }
+    await saveOfflineTrack({ ...track, audio, audioType: audio.type || track.audioMimeType || "audio/mpeg", bytes: audio.size, savedAt: Date.now() });
+    setOfflineTracks(await listOfflineTracks());
+    setToast(`${track.name} is available offline`);
   };
 
   const downloadTrack = async (track: YouTubeVideo) => {
     if (!track.audioUrl) {
-      importTrackRef.current = track;
-      importInputRef.current?.click();
+      setToast("Offline download is not available for this track yet");
       return;
     }
-    setOfflineBusy(true);
+    setDownloadingTrackId(track.id);
     try {
       const response = await fetch(track.audioUrl);
       if (!response.ok) throw new Error("Audio download failed");
-      await storeOfflineAudio(track, await response.blob());
+      const audio = await response.blob();
+      if (!audio.type.startsWith("audio/")) throw new Error("The source did not return audio");
+
+      await storeOfflineAudio(track, audio);
+
+      const extension = audio.type.includes("mpeg") ? "mp3" : audio.type.includes("mp4") ? "mp4" : audio.type.split("/")[1] || "audio";
+      const fileName = `${track.artist_name} - ${track.name}`.replace(/[<>:\"/\\|?*\u0000-\u001F]/g, "_").slice(0, 160);
+      const fileUrl = URL.createObjectURL(audio);
+      const fileLink = document.createElement("a");
+      fileLink.href = fileUrl;
+      fileLink.download = `${fileName}.${extension}`;
+      document.body.appendChild(fileLink);
+      fileLink.click();
+      fileLink.remove();
+      window.setTimeout(() => URL.revokeObjectURL(fileUrl), 1000);
     } catch {
-      setOfflineBusy(false);
-      setToast("This source did not provide a downloadable audio file");
+      setToast("Could not download this track for offline listening");
+    } finally {
+      setDownloadingTrackId(null);
     }
   };
 
@@ -368,19 +373,6 @@ export default function HomePage() {
     } catch {
       setToast("Could not remove the offline track");
     }
-  };
-
-  const handleOfflineFile = async (event: ChangeEvent<HTMLInputElement>) => {
-    const file = event.target.files?.[0];
-    const track = importTrackRef.current;
-    event.target.value = "";
-    importTrackRef.current = null;
-    if (!file || !track) return;
-    if (!file.type.startsWith("audio/")) {
-      setToast("Choose an audio file");
-      return;
-    }
-    await storeOfflineAudio(track, file);
   };
 
   const shufflePlay = () => {
@@ -402,7 +394,7 @@ export default function HomePage() {
         <p className="track-artist">{track.artist_name} · {track.duration ? formatTime(track.duration) : "Track"}</p>
         <div className="card-actions">
           <button type="button" className={isFavorite ? "saved" : ""} onClick={() => toggleFavorite(track)}>{isFavorite ? "♥ Saved" : "♡ Save"}</button>
-          <button type="button" className={isOffline ? "saved" : ""} disabled={offlineBusy} onClick={() => isOffline ? void removeOfflineTrack(track) : void downloadTrack(track)}>{isOffline ? "✓ Offline" : track.audioUrl ? "⇩ Download" : "⇧ Import"}</button>
+          <button type="button" className={`download-button ${isOffline ? "saved" : ""}`} disabled={downloadingTrackId !== null} onClick={() => isOffline ? void removeOfflineTrack(track) : void downloadTrack(track)}>{isOffline ? "✓ Offline" : downloadingTrackId === track.id ? <><span className="download-spinner" aria-hidden="true" /> Downloading…</> : "⇩ Download"}</button>
           <button type="button" onClick={() => playTrack(track)}>{isSelected ? "Playing" : "Play"}</button>
         </div>
       </article>
@@ -481,7 +473,6 @@ export default function HomePage() {
           <div className="player-controls"><div className="progress-line"><span>{formatTime(currentTime)}</span><input aria-label="Track progress" type="range" min="0" max={selected.duration || 1} value={Math.min(currentTime, selected.duration || 1)} onChange={(event) => seekTo(Number(event.target.value))} /><span>{formatTime(selected.duration)}</span></div><div className="control-row"><button type="button" onClick={() => seekBy(-10)} aria-label="Back ten seconds">↶<small>10</small></button><button type="button" onClick={() => seekBy(-30)} aria-label="Previous thirty seconds">⏮</button><button className="main-play" type="button" onClick={togglePlayback} aria-label={isPlaying ? "Pause" : "Play"}>{isPlaying ? "Ⅱ" : "▶"}</button><button type="button" onClick={() => seekBy(30)} aria-label="Next thirty seconds">⏭</button><button type="button" onClick={() => seekBy(10)} aria-label="Forward ten seconds">↷<small>10</small></button></div><div className="control-bottom"><button type="button" className={captionsEnabled ? "control-active" : ""} onClick={() => setCaptionsEnabled(!captionsEnabled)}>CC Subtitles</button><label>Volume <input aria-label="Volume" type="range" min="0" max="100" value={volume} onChange={(event) => setPlayerVolume(Number(event.target.value))} /></label><button type="button" onClick={toggleFullScreen}>⛶ Fullscreen</button></div></div>
         </section>
       ) : null}
-      <input ref={importInputRef} type="file" accept="audio/*" hidden onChange={handleOfflineFile} />
       {toast ? <div className="toast" role="status">{toast}</div> : null}
     </div>
   );
